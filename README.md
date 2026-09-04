@@ -1,4 +1,4 @@
-# Pennywise Student
+# ClockItPocket
 
 Personal-finance companion for students, built with React, FastAPI, and SQLite.
 
