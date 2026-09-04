@@ -282,21 +282,48 @@ init()
 async def resolve_user(request: Request, call_next):
     token = active_profile_id.set(None)
     email = request.headers.get('X-User-Email', '').strip().lower()
+
+    auth_public = request.url.path in (
+        '/',
+        '/docs',
+        '/redoc',
+        '/openapi.json',
+        '/favicon.ico',
+        '/api/auth/signup',
+        '/api/auth/resend',
+        '/api/auth/verify',
+        '/api/auth/login',
+        '/api/auth/status',
+    )
+
     if email:
         c = conn()
-        row = c.execute('SELECT u.id FROM users u JOIN auth_users a ON lower(a.email)=lower(u.email) WHERE lower(a.email)=? AND a.verified=1', (email,)).fetchone()
-        c.close()
-        if row:
-            active_profile_id.set(row['id'])
-    auth_public = request.url.path in ('/',"/docs", "/redoc", "/openapi.json", "/favicon.ico",'/api/auth/signup', '/api/auth/resend', '/api/auth/verify', '/api/auth/login', '/api/auth/status')
-    if not auth_public and not email:
+        try:
+            auth_row = c.execute(
+                'SELECT * FROM auth_users WHERE lower(email)=? AND verified=1',
+                (email,)
+            ).fetchone()
+
+            if auth_row:
+                profile_id = ensure_profile(c, auth_row)
+                c.execute(
+                    'UPDATE users SET email=?, name=? WHERE id=?',
+                    (auth_row['email'], auth_row['name'] or '', profile_id)
+                )
+                c.commit()
+                active_profile_id.set(profile_id)
+        finally:
+            c.close()
+
+    if not auth_public and active_profile_id.get() is None:
         active_profile_id.reset(token)
         raise HTTPException(401, 'An active verified account is required.')
+
     try:
         return await call_next(request)
     finally:
         active_profile_id.reset(token)
-
+        
 def require_active_profile():
     profile_id = active_profile_id.get()
     if profile_id is None:
