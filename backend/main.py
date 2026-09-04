@@ -6,6 +6,9 @@ import sqlite3, os, calendar, hashlib, secrets, smtplib, ssl
 from contextvars import ContextVar
 from email.message import EmailMessage
 from datetime import date, datetime, timedelta
+import json
+import urllib.request
+import urllib.error
 
 DB = os.path.join(os.path.dirname(__file__), "student_finance.db")
 active_profile_id = ContextVar('active_profile_id', default=None)
@@ -60,7 +63,7 @@ async def resolve_user(request: Request, call_next):
         c.close()
         if row:
             active_profile_id.set(row['id'])
-    auth_public = request.url.path in ('/','/api/auth/signup', '/api/auth/resend', '/api/auth/verify', '/api/auth/login', '/api/auth/status')
+    auth_public = request.url.path in ('/api/auth/signup', '/api/auth/resend', '/api/auth/verify', '/api/auth/login', '/api/auth/status')
     if not auth_public and not email:
         active_profile_id.reset(token)
         raise HTTPException(401, 'An active verified account is required.')
@@ -97,12 +100,56 @@ def mask_email(email:str):
     local, domain = email.split('@',1)
     return f"{local[:2]}***@{domain}"
 
-def send_otp_email(recipient:str, otp:str):
-    host=os.getenv('SMTP_HOST', 'smtp.gmail.com')
-    port=int(os.getenv('SMTP_PORT', '587'))
-    username=os.getenv('SMTP_USERNAME', 'githappens192@gmail.com')
-    password=os.getenv('SMTP_PASSWORD')
-    sender=os.getenv('SMTP_FROM', 'ClockItPocket <githappens192@gmail.com>')
+def send_otp_email(recipient: str, otp: str):
+    api_key = os.getenv('RESEND_API_KEY')
+    sender = os.getenv(
+        'RESEND_FROM',
+        'ClockItPocket <onboarding@resend.dev>'
+    )
+
+    if not api_key:
+        raise RuntimeError('RESEND_API_KEY is not configured.')
+
+    payload = {
+        'from': sender,
+        'to': [recipient],
+        'subject': 'Your ClockItPocket verification code',
+        'text': (
+            f'Your ClockItPocket verification code is {otp}.\n\n'
+            'This code expires in 5 minutes. '
+            'If you did not request it, ignore this email.'
+        )
+    }
+
+    data = json.dumps(payload).encode('utf-8')
+
+    request = urllib.request.Request(
+        'https://api.resend.com/emails',
+        data=data,
+        method='POST',
+        headers={
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+            'User-Agent': 'ClockItPocket/1.0'
+        }
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            response_data = response.read().decode('utf-8')
+            return {
+                'ok': True,
+                'response': response_data
+            }
+    except urllib.error.HTTPError as error:
+        error_body = error.read().decode('utf-8', errors='replace')
+        raise RuntimeError(
+            f'Resend API error {error.code}: {error_body}'
+        ) from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(
+            f'Resend connection error: {error.reason}'
+        ) from error
 
     if not password:
         print(f'OTP demo mode: using Gmail sender {sender} for {recipient} | code: {otp}')
@@ -177,13 +224,11 @@ def auth_signup(body:Data):
         VALUES(?,?,?,?,?,?,?)
     ''', (name, email, hash_secret(password), otp_hash, expires, 0, datetime.now().isoformat()))
     try:
-        smtp_result = send_otp_email(email, otp)
+        email_result = send_otp_email(email, otp)
     except (OSError, ValueError, smtplib.SMTPException, RuntimeError) as error:
         c.rollback(); c.close()
         raise HTTPException(503, 'We could not send the verification email. Please try again later.') from error
     c.commit(); c.close()
-    if smtp_result.get('demo'):
-        return {'ok': True, 'masked_email': mask_email(email), 'otp': otp}
     return {'ok': True, 'masked_email': mask_email(email)}
 
 @app.post('/api/auth/resend')
@@ -203,15 +248,12 @@ def auth_resend(body:Data):
     expires = (datetime.now() + timedelta(minutes=5)).isoformat()
     c.execute('UPDATE auth_users SET otp_hash=?, otp_expires_at=? WHERE id=?', (hash_secret(otp), expires, row['id']))
     try:
-        smtp_result = send_otp_email(email, otp)
+        email_result = send_otp_email(email, otp)
     except (OSError, ValueError, smtplib.SMTPException, RuntimeError) as error:
         c.rollback(); c.close()
         raise HTTPException(503, 'We could not send the verification email. Please try again later.') from error
     c.commit(); c.close()
-    result = {'ok': True, 'masked_email': mask_email(email)}
-    if smtp_result.get('demo'):
-        result['otp'] = otp
-    return result
+    return {'ok': True, 'masked_email': mask_email(email)}
 
 @app.post('/api/auth/verify')
 def auth_verify(body:Data):
