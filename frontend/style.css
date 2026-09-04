@@ -29,7 +29,22 @@ aside {
   color: white;
   position: fixed;
   inset: 0 auto 0 0;
+
+  /* Sidebar scrolling */
+  height: 100vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  box-sizing: border-box;
 }
+
+aside::-webkit-scrollbar {
+  width: 6px;
+}
+
+aside::-webkit-scrollbar-thumb {
+  border-radius: 10px;
+}
+
 .brand {
   font-size: 34px;
   font-weight: 600;
