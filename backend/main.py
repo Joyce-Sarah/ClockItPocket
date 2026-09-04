@@ -63,7 +63,7 @@ async def resolve_user(request: Request, call_next):
         c.close()
         if row:
             active_profile_id.set(row['id'])
-    auth_public = request.url.path in ('/api/auth/signup', '/api/auth/resend', '/api/auth/verify', '/api/auth/login', '/api/auth/status')
+    auth_public = request.url.path in ('/','/api/auth/signup', '/api/auth/resend', '/api/auth/verify', '/api/auth/login', '/api/auth/status')
     if not auth_public and not email:
         active_profile_id.reset(token)
         raise HTTPException(401, 'An active verified account is required.')
