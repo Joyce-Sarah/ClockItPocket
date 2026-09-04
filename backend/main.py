@@ -2,15 +2,15 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
-import sqlite3, os, calendar, hashlib, secrets, smtplib, ssl
+import psycopg
+from psycopg.rows import dict_row
+import os, calendar, hashlib, secrets
 from contextvars import ContextVar
-from email.message import EmailMessage
 from datetime import date, datetime, timedelta
 import json
 import urllib.request
 import urllib.error
 
-DB = os.path.join(os.path.dirname(__file__), "student_finance.db")
 active_profile_id = ContextVar('active_profile_id', default=None)
 
 def load_env_file():
@@ -26,31 +26,256 @@ def load_env_file():
             os.environ.setdefault(key.strip(), value.strip().strip('"\''))
 
 load_env_file()
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not configured.")
+
 app = FastAPI(title="Pennywise Student Finance API")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
+def _adapt_sql(sql, args=()):
+    args = tuple(args or ())
+    out = []
+    new_args = []
+    i = 0
+    quote = None
+    while i < len(sql):
+        ch = sql[i]
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                if i + 1 < len(sql) and sql[i + 1] == quote:
+                    out.append(sql[i + 1])
+                    i += 1
+                else:
+                    quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if sql.startswith('active_user_id()', i):
+            out.append('%s')
+            new_args.append(active_profile_id.get())
+            i += len('active_user_id()')
+            continue
+        if ch == '?':
+            out.append('%s')
+            if len(new_args) >= 0:
+                # Positional parameters are consumed in SQL order.
+                q_index = len([x for x in out if x == '%s']) - 1
+                # active_user_id() parameters are already in new_args, so use
+                # the next original '?' argument by counting '?' placeholders.
+                pass
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+
+    # Rebuild parameter order by scanning placeholders again.
+    final_args = []
+    arg_index = 0
+    active_count = 0
+    i = 0
+    quote = None
+    while i < len(sql):
+        ch = sql[i]
+        if quote:
+            if ch == quote:
+                if i + 1 < len(sql) and sql[i + 1] == quote:
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if sql.startswith('active_user_id()', i):
+            final_args.append(active_profile_id.get())
+            active_count += 1
+            i += len('active_user_id()')
+            continue
+        if ch == '?':
+            if arg_index >= len(args):
+                raise ValueError('Not enough SQL parameters supplied.')
+            final_args.append(args[arg_index])
+            arg_index += 1
+        i += 1
+    if arg_index != len(args):
+        raise ValueError('Too many SQL parameters supplied.')
+
+    # The first pass produced the correctly rewritten SQL.
+    return ''.join(out), tuple(final_args)
+
+
+def _convert_insert_or_ignore(sql):
+    import re
+    pattern = re.compile(r'INSERT\s+OR\s+IGNORE\s+INTO', re.IGNORECASE)
+    if not pattern.search(sql):
+        return sql
+    sql = pattern.sub('INSERT INTO', sql, count=1)
+    # All INSERT OR IGNORE statements in this app end with VALUES(...).
+    pos = sql.rfind(')')
+    if pos == -1:
+        return sql
+    return sql[:pos + 1] + ' ON CONFLICT DO NOTHING' + sql[pos + 1:]
+
+
+class PGConnection:
+    def __init__(self, raw):
+        self.raw = raw
+
+    def execute(self, sql, args=()):
+        sql, args = _adapt_sql(_convert_insert_or_ignore(sql), args)
+        return self.raw.execute(sql, args)
+
+    def executemany(self, sql, seq_of_args):
+        sql = _convert_insert_or_ignore(sql)
+        for args in seq_of_args:
+            self.raw.execute(*_adapt_sql(sql, args))
+        return self
+
+    def commit(self):
+        return self.raw.commit()
+
+    def rollback(self):
+        return self.raw.rollback()
+
+    def close(self):
+        return self.raw.close()
+
+
 def conn():
-    c=sqlite3.connect(DB)
-    c.row_factory=sqlite3.Row
-    c.create_function('active_user_id', 0, lambda: active_profile_id.get() or (_ for _ in ()).throw(sqlite3.OperationalError('Active user session required')))
-    return c
+    return PGConnection(psycopg.connect(DATABASE_URL, row_factory=dict_row))
 def rows(c): return [dict(x) for x in c.fetchall()]
 def init():
- c=conn(); c.executescript('''
- CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, email TEXT, student_type TEXT, currency TEXT DEFAULT 'INR', income_source TEXT, monthly_income REAL DEFAULT 0, rent REAL DEFAULT 0, tuition REAL DEFAULT 0, onboarded INTEGER DEFAULT 0);
- CREATE TABLE IF NOT EXISTS auth_users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT UNIQUE, password_hash TEXT, otp_hash TEXT, otp_expires_at TEXT, verified INTEGER DEFAULT 0, created_at TEXT);
- CREATE TABLE IF NOT EXISTS categories (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, name TEXT, color TEXT, UNIQUE(user_id,name));
- CREATE TABLE IF NOT EXISTS transactions (id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,description TEXT,amount REAL,date TEXT,type TEXT,category TEXT);
- CREATE TABLE IF NOT EXISTS budgets (id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,month TEXT,income REAL DEFAULT 0,spending_limit REAL DEFAULT 0,savings_target REAL DEFAULT 0, UNIQUE(user_id,month));
- CREATE TABLE IF NOT EXISTS category_budgets (id INTEGER PRIMARY KEY AUTOINCREMENT,budget_id INTEGER,category TEXT,amount REAL, UNIQUE(budget_id,category));
- CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,message TEXT,level TEXT,read INTEGER DEFAULT 0,key TEXT,created_at TEXT, UNIQUE(user_id,key));
- CREATE TABLE IF NOT EXISTS goals (id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,name TEXT,target REAL,current REAL DEFAULT 0,target_date TEXT);
- CREATE TABLE IF NOT EXISTS planned_expenses (id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,description TEXT,amount REAL,category TEXT,expected_date TEXT,reminder_time TEXT DEFAULT '09:00',reminder_offset TEXT DEFAULT '1 day before',recurrence TEXT DEFAULT 'None',payment_status TEXT DEFAULT 'pending');
- ''');
- for column,definition in [('reminder_time',"TEXT DEFAULT '09:00'"),('reminder_offset',"TEXT DEFAULT '1 day before'"),('recurrence',"TEXT DEFAULT 'None'"),('payment_status',"TEXT DEFAULT 'pending'")]:
-  try: c.execute(f'ALTER TABLE planned_expenses ADD COLUMN {column} {definition}')
-  except sqlite3.OperationalError: pass
- c.execute("INSERT OR IGNORE INTO users(id,name,email,onboarded) VALUES(1,'','','0')"); c.commit(); c.close()
+    c = conn()
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            name TEXT,
+            email TEXT,
+            student_type TEXT,
+            currency TEXT DEFAULT 'INR',
+            income_source TEXT,
+            monthly_income DOUBLE PRECISION DEFAULT 0,
+            rent DOUBLE PRECISION DEFAULT 0,
+            tuition DOUBLE PRECISION DEFAULT 0,
+            onboarded INTEGER DEFAULT 0
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS auth_users (
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            name TEXT,
+            email TEXT UNIQUE,
+            password_hash TEXT,
+            otp_hash TEXT,
+            otp_expires_at TEXT,
+            verified INTEGER DEFAULT 0,
+            created_at TEXT
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS categories (
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            user_id INTEGER,
+            name TEXT,
+            color TEXT,
+            UNIQUE(user_id, name)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            user_id INTEGER,
+            description TEXT,
+            amount DOUBLE PRECISION,
+            date TEXT,
+            type TEXT,
+            category TEXT
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS budgets (
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            user_id INTEGER,
+            month TEXT,
+            income DOUBLE PRECISION DEFAULT 0,
+            spending_limit DOUBLE PRECISION DEFAULT 0,
+            savings_target DOUBLE PRECISION DEFAULT 0,
+            UNIQUE(user_id, month)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS category_budgets (
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            budget_id INTEGER,
+            category TEXT,
+            amount DOUBLE PRECISION,
+            UNIQUE(budget_id, category)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            user_id INTEGER,
+            message TEXT,
+            level TEXT,
+            read INTEGER DEFAULT 0,
+            key TEXT,
+            created_at TEXT,
+            UNIQUE(user_id, key)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS goals (
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            user_id INTEGER,
+            name TEXT,
+            target DOUBLE PRECISION,
+            current DOUBLE PRECISION DEFAULT 0,
+            target_date TEXT
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS planned_expenses (
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            user_id INTEGER,
+            description TEXT,
+            amount DOUBLE PRECISION,
+            category TEXT,
+            expected_date TEXT,
+            reminder_time TEXT DEFAULT '09:00',
+            reminder_offset TEXT DEFAULT '1 day before',
+            recurrence TEXT DEFAULT 'None',
+            payment_status TEXT DEFAULT 'pending'
+        )
+    """)
+
+    c.execute("""
+        INSERT INTO users (id, name, email, onboarded)
+        VALUES (1, '', '', 0)
+        ON CONFLICT (id) DO NOTHING
+    """)
+
+    c.commit()
+    c.close()
+
+
 init()
 
 @app.middleware('http')
@@ -87,8 +312,7 @@ def ensure_profile(c, auth_row):
     if empty:
         c.execute('UPDATE users SET name=?, email=? WHERE id=?', (auth_row['name'] or '', email, empty['id']))
         return empty['id']
-    c.execute("INSERT INTO users(name,email,student_type,currency,income_source,monthly_income,rent,tuition,onboarded) VALUES(?,?,NULL,'INR',NULL,0,0,0,0)", (auth_row['name'] or '', email))
-    return c.execute('SELECT last_insert_rowid()').fetchone()[0]
+    return c.execute("INSERT INTO users(name,email,student_type,currency,income_source,monthly_income,rent,tuition,onboarded) VALUES(?, ?, NULL, 'INR', NULL, 0, 0, 0, 0) RETURNING id", (auth_row['name'] or '', email)).fetchone()['id']
 COLORS=['#AA81BD','#7E9AD3','#E29B79','#78B99A','#D187A4','#D2A855','#8492A6','#B587C9']
 DEFAULTS=['Books & Supplies','Shopping','Food','Bills','Fun','Travel','Tuitions','Others']
 
@@ -151,30 +375,10 @@ def send_otp_email(recipient: str, otp: str):
             f'Resend connection error: {error.reason}'
         ) from error
 
-    if not password:
-        print(f'OTP demo mode: using Gmail sender {sender} for {recipient} | code: {otp}')
-        return {'demo': True, 'otp': otp}
-
-    message=EmailMessage()
-    message['Subject']='Your ClockItPocket verification code'
-    message['From']=sender
-    message['To']=recipient
-    message.set_content(f'Your ClockItPocket verification code is {otp}.\n\nThis code expires in 5 minutes. If you did not request it, ignore this email.')
-    context=ssl.create_default_context()
-    if port==465:
-        with smtplib.SMTP_SSL(host,port,context=context,timeout=15) as server:
-            server.login(username,password)
-            server.send_message(message)
-    else:
-        with smtplib.SMTP(host,port,timeout=15) as server:
-            server.starttls(context=context)
-            server.login(username,password)
-            server.send_message(message)
-    return {'demo': False, 'otp': otp}
-
 def month(): return date.today().strftime('%Y-%m')
 def scalar(c,q,args=()):
- r=c.execute(q,args).fetchone(); return r[0] if r else 0
+    r=c.execute(q,args).fetchone()
+    return next(iter(r.values())) if r else 0
 def budget(c,m=None):
  require_active_profile(); m=m or month(); u=c.execute('SELECT * FROM users WHERE id=active_user_id()').fetchone(); c.execute('INSERT OR IGNORE INTO budgets(user_id,month,income,spending_limit,savings_target) VALUES(active_user_id(),?,?,?,0)',(m,u['monthly_income'],u['monthly_income'])); c.commit(); return c.execute('SELECT * FROM budgets WHERE user_id=active_user_id() AND month=?',(m,)).fetchone()
 def notify(c):
@@ -225,7 +429,7 @@ def auth_signup(body:Data):
     ''', (name, email, hash_secret(password), otp_hash, expires, 0, datetime.now().isoformat()))
     try:
         email_result = send_otp_email(email, otp)
-    except (OSError, ValueError, smtplib.SMTPException, RuntimeError) as error:
+    except (OSError, ValueError, RuntimeError) as error:
         c.rollback(); c.close()
         raise HTTPException(503, 'We could not send the verification email. Please try again later.') from error
     c.commit(); c.close()
@@ -249,7 +453,7 @@ def auth_resend(body:Data):
     c.execute('UPDATE auth_users SET otp_hash=?, otp_expires_at=? WHERE id=?', (hash_secret(otp), expires, row['id']))
     try:
         email_result = send_otp_email(email, otp)
-    except (OSError, ValueError, smtplib.SMTPException, RuntimeError) as error:
+    except (OSError, ValueError, RuntimeError) as error:
         c.rollback(); c.close()
         raise HTTPException(503, 'We could not send the verification email. Please try again later.') from error
     c.commit(); c.close()
